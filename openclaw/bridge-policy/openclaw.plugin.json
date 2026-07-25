@@ -1,0 +1,33 @@
+{
+  "id": "wechat-codex-bridge-policy",
+  "name": "微信—Codex 桥接策略",
+  "description": "微信单人私聊、入站幂等、精确批准和投递回执边界",
+  "enabledByDefault": false,
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "dbPath": {
+        "type": "string",
+        "minLength": 1
+      },
+      "channelId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "authorizedRecipients": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uniqueItems": true
+      },
+      "approvalTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 3600000
+      }
+    },
+    "additionalProperties": false
+  }
+}

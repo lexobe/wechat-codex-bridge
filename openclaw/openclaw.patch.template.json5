@@ -1,0 +1,90 @@
+{
+  update: {
+    // 显式关闭后台自动升级。启动脚本还会设置 OPENCLAW_NO_AUTO_UPDATE=1，
+    // 并在版本不完全匹配时拒绝启动。
+    auto: {
+      enabled: false,
+    },
+  },
+  agents: {
+    defaults: {
+      workspace: "/ABSOLUTE/PATH/WeChat 通信",
+      model: {
+        primary: "openai/gpt-5.6-sol",
+        fallbacks: [],
+      },
+      models: {
+        "openai/gpt-5.6-sol": {
+          agentRuntime: {
+            id: "codex",
+          },
+        },
+      },
+      memorySearch: {
+        enabled: false,
+      },
+    },
+  },
+  session: {
+    scope: "per-sender",
+    dmScope: "per-account-channel-peer",
+  },
+  plugins: {
+    bundledDiscovery: "allowlist",
+    allow: [
+      "openai",
+      "codex",
+      "openclaw-weixin",
+      "wechat-codex-bridge-policy",
+    ],
+    slots: {
+      memory: "none",
+    },
+    entries: {
+      codex: {
+        enabled: true,
+        config: {
+          codexDynamicToolsLoading: "searchable",
+          codexDynamicToolsExclude: [
+            "web_search",
+            "browser",
+            "computer",
+          ],
+          codexPlugins: {
+            enabled: false,
+          },
+          computerUse: {
+            enabled: false,
+            autoInstall: false,
+          },
+          appServer: {
+            mode: "guardian",
+            transport: "stdio",
+            homeScope: "agent",
+            approvalPolicy: "on-request",
+            approvalsReviewer: "user",
+            sandbox: "read-only",
+            networkProxy: {
+              enabled: false,
+            },
+            defaultWorkspaceDir: "/ABSOLUTE/PATH/WeChat 通信",
+          },
+        },
+      },
+      "openclaw-weixin": {
+        enabled: true,
+      },
+      "wechat-codex-bridge-policy": {
+        enabled: true,
+        config: {
+          dbPath: "/ABSOLUTE/PATH/WeChat 通信/var/bridge.db",
+          channelId: "openclaw-weixin",
+          // 首次登录后先保持为空。发送一条发现消息，读取被拒绝记录中的 sender_id，
+          // 经人工核对后再把唯一 ID 写入此数组并重启前台 Gateway。
+          authorizedRecipients: [],
+          approvalTimeoutMs: 300000,
+        },
+      },
+    },
+  },
+}

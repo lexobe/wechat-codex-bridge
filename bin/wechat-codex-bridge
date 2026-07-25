@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+OPENCLAW_VERSION="2026.7.1-2"
+NODE_VERSION="v24.15.0"
+CODEX_PLUGIN_VERSION="2026.7.1-1"
+WEIXIN_PLUGIN_VERSION="2.4.6"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+OPENCLAW_PREFIX="${OPENCLAW_PREFIX:-$HOME/.openclaw}"
+OPENCLAW_BIN="$OPENCLAW_PREFIX/bin/openclaw"
+PINNED_NODE="$OPENCLAW_PREFIX/tools/node-v24.15.0/bin/node"
+
+usage() {
+  cat <<'EOF'
+用法：wechat-codex-bridge <命令>
+
+命令：
+  install     安装固定版本 OpenClaw、Codex 插件、微信插件和本地策略插件
+  configure   写入安全的固定版本运行配置，不写入微信身份或令牌
+  login       依次启动独立 Codex OAuth 和微信二维码登录
+  check       检查版本锁、配置、插件和自动升级开关
+  run         通过版本门禁后以前台方式启动 Gateway
+  version     输出本组件锁定的所有版本
+
+环境变量：
+  OPENCLAW_PREFIX  OpenClaw 用户本地安装目录，默认 ~/.openclaw
+EOF
+}
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+require_openclaw() {
+  [[ -x "$OPENCLAW_BIN" ]] || die "未找到 $OPENCLAW_BIN，请先运行 install"
+}
+
+expect_contains() {
+  local actual="$1"
+  local expected="$2"
+  local label="$3"
+  [[ "$actual" == *"$expected"* ]] ||
+    die "$label 版本不匹配；需要 $expected，实际为 $actual"
+}
+
+check_core_versions() {
+  require_openclaw
+  [[ -x "$PINNED_NODE" ]] || die "未找到固定版 Node：$PINNED_NODE"
+
+  expect_contains "$("$OPENCLAW_BIN" --version)" "$OPENCLAW_VERSION" "OpenClaw"
+  expect_contains "$("$PINNED_NODE" --version)" "$NODE_VERSION" "Node"
+}
+
+check_versions() {
+  check_core_versions
+  local codex_info
+  local weixin_info
+  codex_info="$("$OPENCLAW_BIN" plugins inspect codex --json)"
+  weixin_info="$("$OPENCLAW_BIN" plugins inspect openclaw-weixin --json)"
+  expect_contains "$codex_info" "\"version\": \"$CODEX_PLUGIN_VERSION\"" "Codex 插件"
+  expect_contains "$weixin_info" "\"version\": \"$WEIXIN_PLUGIN_VERSION\"" "微信插件"
+}
+
+install_plugin_if_missing() {
+  local plugin_id="$1"
+  local plugin_spec="$2"
+  if "$OPENCLAW_BIN" plugins inspect "$plugin_id" --json >/dev/null 2>&1; then
+    printf '插件 %s 已存在，保留当前安装并交给版本门禁校验。\n' "$plugin_id" >&2
+    return
+  fi
+  "$OPENCLAW_BIN" plugins install "$plugin_spec"
+}
+
+cmd_version() {
+  printf 'wechat-codex-bridge 0.1.0\n'
+  printf 'OpenClaw %s\n' "$OPENCLAW_VERSION"
+  printf 'Node.js %s\n' "${NODE_VERSION#v}"
+  printf '@openclaw/codex %s\n' "$CODEX_PLUGIN_VERSION"
+  printf '@tencent-weixin/openclaw-weixin %s\n' "$WEIXIN_PLUGIN_VERSION"
+}
+
+cmd_install() {
+  if [[ -x "$OPENCLAW_BIN" ]]; then
+    check_core_versions
+    printf '固定版本 OpenClaw 已存在，跳过核心安装。\n' >&2
+  else
+    curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install-cli.sh |
+      bash -s -- \
+        --prefix "$OPENCLAW_PREFIX" \
+        --version "$OPENCLAW_VERSION" \
+        --no-onboard
+  fi
+
+  "$OPENCLAW_BIN" setup \
+    --baseline \
+    --non-interactive \
+    --accept-risk \
+    --no-install-daemon \
+    --skip-ui \
+    --workspace "$PROJECT_DIR"
+
+  install_plugin_if_missing codex "@openclaw/codex@$CODEX_PLUGIN_VERSION"
+  install_plugin_if_missing \
+    openclaw-weixin \
+    "@tencent-weixin/openclaw-weixin@$WEIXIN_PLUGIN_VERSION"
+  install_plugin_if_missing \
+    wechat-codex-bridge-policy \
+    "$PROJECT_DIR/openclaw/bridge-policy"
+
+  cmd_configure
+  check_versions
+  printf '安装完成。下一步运行：%s login\n' "$0"
+}
+
+cmd_configure() {
+  require_openclaw
+  mkdir -p "$PROJECT_DIR/var"
+
+  "$OPENCLAW_BIN" config set update.auto.enabled false --strict-json
+  "$OPENCLAW_BIN" config set plugins.bundledDiscovery allowlist
+  "$OPENCLAW_BIN" config set agents.defaults.workspace "$PROJECT_DIR"
+  "$OPENCLAW_BIN" config set agents.defaults.model.primary openai/gpt-5.6-sol
+  "$OPENCLAW_BIN" config set agents.defaults.model.fallbacks '[]' --strict-json
+  "$OPENCLAW_BIN" config set \
+    'agents.defaults.models["openai/gpt-5.6-sol"].agentRuntime.id' codex
+  "$OPENCLAW_BIN" config set agents.defaults.memorySearch.enabled false --strict-json
+  "$OPENCLAW_BIN" config set session.scope per-sender
+  "$OPENCLAW_BIN" config set session.dmScope per-account-channel-peer
+  "$OPENCLAW_BIN" config set \
+    plugins.allow \
+    '["openai","codex","openclaw-weixin","wechat-codex-bridge-policy"]' \
+    --strict-json --replace
+  "$OPENCLAW_BIN" config set plugins.slots.memory none
+
+  "$OPENCLAW_BIN" config set plugins.entries.codex.enabled true --strict-json
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.codexDynamicToolsLoading searchable
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.codexDynamicToolsExclude \
+    '["web_search","browser","computer"]' --strict-json --replace
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.codexPlugins.enabled false --strict-json
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.computerUse.enabled false --strict-json
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.computerUse.autoInstall false --strict-json
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.mode guardian
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.transport stdio
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.homeScope agent
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.approvalPolicy on-request
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.approvalsReviewer user
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.sandbox read-only
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.networkProxy.enabled false --strict-json
+  "$OPENCLAW_BIN" config set \
+    plugins.entries.codex.config.appServer.defaultWorkspaceDir "$PROJECT_DIR"
+
+  "$OPENCLAW_BIN" config set \
+    'plugins.entries["openclaw-weixin"].enabled' true --strict-json
+  "$OPENCLAW_BIN" config set \
+    'plugins.entries["wechat-codex-bridge-policy"].enabled' true --strict-json
+  "$OPENCLAW_BIN" config set \
+    'plugins.entries["wechat-codex-bridge-policy"].config.dbPath' \
+    "$PROJECT_DIR/var/bridge.db"
+  "$OPENCLAW_BIN" config set \
+    'plugins.entries["wechat-codex-bridge-policy"].config.channelId' \
+    openclaw-weixin
+  if ! "$OPENCLAW_BIN" config get \
+    'plugins.entries["wechat-codex-bridge-policy"].config.authorizedRecipients' \
+    >/dev/null 2>&1; then
+    "$OPENCLAW_BIN" config set \
+      'plugins.entries["wechat-codex-bridge-policy"].config.authorizedRecipients' \
+      '[]' --strict-json --replace
+  fi
+  "$OPENCLAW_BIN" config set \
+    'plugins.entries["wechat-codex-bridge-policy"].config.approvalTimeoutMs' \
+    300000 --strict-json
+
+  "$OPENCLAW_BIN" config validate
+  printf '配置完成；自动升级已显式关闭，白名单保持为空。\n'
+}
+
+cmd_login() {
+  require_openclaw
+  "$OPENCLAW_BIN" models auth --agent main login --provider openai
+  "$OPENCLAW_BIN" channels login --channel openclaw-weixin
+}
+
+cmd_check() {
+  check_versions
+  local auto_update
+  auto_update="$("$OPENCLAW_BIN" config get update.auto.enabled)"
+  [[ "$auto_update" == "false" ]] ||
+    die "update.auto.enabled 必须为 false，实际为 $auto_update"
+
+  "$OPENCLAW_BIN" config validate
+  "$OPENCLAW_BIN" plugins inspect wechat-codex-bridge-policy --runtime --json \
+    >/dev/null
+  printf '检查通过：固定版本匹配、自动升级关闭、配置和策略插件有效。\n'
+}
+
+cmd_run() {
+  cmd_check
+  export OPENCLAW_NO_AUTO_UPDATE=1
+  exec "$OPENCLAW_BIN" gateway run --verbose
+}
+
+command_name="${1:-}"
+case "$command_name" in
+  install) cmd_install ;;
+  configure) cmd_configure ;;
+  login) cmd_login ;;
+  check) cmd_check ;;
+  run) cmd_run ;;
+  version) cmd_version ;;
+  -h | --help | help | "") usage ;;
+  *)
+    usage >&2
+    die "未知命令：$command_name"
+    ;;
+esac

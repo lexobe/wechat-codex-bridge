@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.venv/
+media/
+var/
+openclaw-workspace-state.json
+.DS_Store

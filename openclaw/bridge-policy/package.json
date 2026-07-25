@@ -1,0 +1,18 @@
+{
+  "name": "wechat-codex-bridge-policy",
+  "version": "0.1.0",
+  "private": false,
+  "description": "微信—Codex 单人私聊白名单、幂等、批准和回执策略",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lexobe/wechat-codex-bridge.git",
+    "directory": "openclaw/bridge-policy"
+  },
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}

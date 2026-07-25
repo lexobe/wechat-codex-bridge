@@ -1,0 +1,22 @@
+{
+  "name": "wechat-codex-bridge",
+  "version": "0.1.0",
+  "description": "固定版本、低权限的微信到 Codex 本地通信桥接",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lexobe/wechat-codex-bridge.git"
+  },
+  "bin": {
+    "wechat-codex-bridge": "./bin/wechat-codex-bridge"
+  },
+  "scripts": {
+    "test": "node --test tests-node/*.test.mjs",
+    "check": "./bin/wechat-codex-bridge check"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
