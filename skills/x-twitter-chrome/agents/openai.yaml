@@ -1,0 +1,4 @@
+interface:
+  display_name: "X/Twitter 已登录 Chrome 访问"
+  short_description: "复用已登录 Chrome 安全读取 X，写操作须一次性确认"
+  default_prompt: "使用 $x-twitter-chrome 在已登录的 Chrome 中读取 X 内容；任何写操作先请求一次性确认。"

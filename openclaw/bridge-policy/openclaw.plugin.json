@@ -26,6 +26,93 @@
         "type": "integer",
         "minimum": 1000,
         "maximum": 3600000
+      },
+      "sessionChat": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "pythonPath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "projectRoot": {
+            "type": "string",
+            "minLength": 1
+          },
+          "root": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dbPath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "providerMode": {
+            "type": "string",
+            "enum": [
+              "disabled",
+              "codex"
+            ]
+          },
+          "requiredCodexSkill": {
+            "type": "string",
+            "minLength": 1
+          },
+          "chromeCodexSkill": {
+            "type": "string",
+            "minLength": 1
+          },
+          "chromeBrowserClient": {
+            "type": "string",
+            "minLength": 1
+          },
+          "codexRunner": {
+            "type": "string",
+            "minLength": 1
+          },
+          "codexPluginRoot": {
+            "type": "string",
+            "minLength": 1
+          },
+          "openclawConfig": {
+            "type": "string",
+            "minLength": 1
+          },
+          "openclawAgentDir": {
+            "type": "string",
+            "minLength": 1
+          },
+          "nodePath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "requestTimeoutMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 300000
+          }
+        },
+        "required": [
+          "enabled",
+          "projectRoot",
+          "root",
+          "dbPath",
+          "providerMode",
+          "requiredCodexSkill",
+          "codexRunner",
+          "codexPluginRoot",
+          "openclawConfig",
+          "openclawAgentDir",
+          "nodePath",
+          "model"
+        ],
+        "additionalProperties": false
       }
     },
     "additionalProperties": false

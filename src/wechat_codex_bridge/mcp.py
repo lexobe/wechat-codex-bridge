@@ -8,6 +8,7 @@ from .gateway import Gateway
 from .models import (
     ConfirmationState,
     DeliveryReceipt,
+    OutboundPurpose,
     OutboundRequest,
     PendingAction,
 )
@@ -94,7 +95,41 @@ class ControlledSendTool:
             raise ValueError("确认记录不存在或不处于待确认状态")
 
     def call(self, arguments: dict[str, object]) -> dict[str, str]:
-        request = OutboundRequest(**arguments)
+        request_id = arguments.get("request_id")
+        channel = arguments.get("channel")
+        recipient_key = arguments.get("recipient_key")
+        body = arguments.get("body")
+        purpose = arguments.get("purpose", OutboundPurpose.MESSAGE.value)
+        confirmation_id = arguments.get("confirmation_id")
+        required = {
+            "request_id": request_id,
+            "channel": channel,
+            "recipient_key": recipient_key,
+            "body": body,
+            "purpose": purpose,
+            "confirmation_id": confirmation_id,
+        }
+        invalid = [
+            name
+            for name, value in required.items()
+            if not isinstance(value, str) or not value
+        ]
+        if invalid:
+            raise ValueError(f"发送参数必须是非空字符串：{', '.join(invalid)}")
+        assert isinstance(request_id, str)
+        assert isinstance(channel, str)
+        assert isinstance(recipient_key, str)
+        assert isinstance(body, str)
+        assert isinstance(purpose, str)
+        assert isinstance(confirmation_id, str)
+        request = OutboundRequest(
+            request_id=request_id,
+            channel=channel,
+            recipient_key=recipient_key,
+            body=body,
+            purpose=OutboundPurpose(purpose),
+            confirmation_id=confirmation_id,
+        )
         receipt = self.send(request)
         return {
             "request_id": receipt.request_id,
@@ -126,11 +161,8 @@ class ControlledSendTool:
             receipt = self.gateway.send(request)
             self.store.save_receipt(receipt, payload_hash)
         except Exception:
-            self.store.set_confirmation_state(
-                request.confirmation_id,
-                ConfirmationState.EXECUTING.value,
-                ConfirmationState.APPROVED.value,
-            )
+            # 网关可能已经完成外发，只是回执在返回途中丢失。保留 executing
+            # 作为需要人工核对的未知状态，禁止用同一批准自动重试。
             raise
 
         self.store.set_confirmation_state(

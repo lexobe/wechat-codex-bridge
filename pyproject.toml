@@ -4,9 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wechat-codex-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "低权限微信到 Codex 通信桥接的最小本地原型"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+]
+
+[project.urls]
+Repository = "https://github.com/lexobe/wechat-codex-bridge"
+Changelog = "https://github.com/lexobe/wechat-codex-bridge/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
@@ -15,6 +25,19 @@ test = ["pytest>=8"]
 addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+exclude = [
+  ".venv",
+  ".venv-release-check",
+  "build",
+  "dist",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "RUF100"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
