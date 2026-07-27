@@ -1,10 +1,15 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+*.egg-info/
+build/
+dist/
 *.db
 *.db-shm
 *.db-wal
+**/.session-chat.json
 .venv/
+.venv-release-check/
 media/
 var/
 openclaw-workspace-state.json

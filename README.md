@@ -5,8 +5,9 @@
 ```text
 你的微信私聊
   → 腾讯 OpenClaw 微信插件（收取、路由、投递）
-  → 本仓库策略插件（授权、幂等、确认、回执）
-  → OpenClaw Codex harness
+  → 本仓库策略插件（授权、幂等、目录协议、确认、回执）
+  → 普通消息：OpenClaw Codex harness
+    目录消息：持久 session-chat 进程 → 已准入 provider
   → Codex 原生 App Server 线程
   → 腾讯 OpenClaw 微信插件
   → 你的微信私聊
@@ -15,6 +16,9 @@
 OpenClaw 只保留渠道、会话路由、批准和投递职责；Codex 是内部决策与执行单元。
 中间没有另建中央业务服务。SQLite 只用于持久化、幂等和一次性确认，不承载业务
 判断。
+
+冻结协议和安全边界见 [`SPEC.md`](SPEC.md)，版本变化见
+[`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 三步开始
 
@@ -40,6 +44,16 @@ cd wechat-codex-bridge
 
 首次扫码后仍需按“微信扫码与唯一联系人授权”一节核对并写入唯一白名单联系人。
 脚本刻意不自动猜测或授权微信身份。
+
+`configure` 会把目录会话路由接入真实微信入口，但把
+`sessionChat.providerMode` 保持为 `disabled`。这是有意的安全状态：当前没有
+完成一次性“无正文创建 + 跨进程恢复”外部合同探针，三种目录消息会收到明确的
+`ProviderNotAdmitted`，不会落到 mock、不会创建目录，也不会误用 OpenClaw 默认
+会话。普通微信消息不受影响。探针通过后，由维护者显式执行
+`SESSION_CHAT_PROVIDER_MODE=codex ./bin/wechat-codex-bridge configure` 才会启用。
+可用绝对路径环境变量 `SESSION_CHAT_ROOT` 把目录会话工作根目录与代码目录分离，
+例如 `SESSION_CHAT_ROOT="$HOME/brain"`；配置会保存其规范化绝对路径，并把版本化
+X 技能安装到该 ROOT 的 `skills/x-twitter-chrome/`。
 
 命令入口保持很小：
 
@@ -72,11 +86,212 @@ cd wechat-codex-bridge
 - `openclaw/bridge-policy/`：OpenClaw 运行时策略插件。
 - `openclaw/openclaw.patch.template.json5`：无账号、令牌和真实路径的配置模板。
 - `src/wechat_codex_bridge/`：可独立测试的 Python 契约、模拟 Codex 和模拟网关。
+- `src/wechat_codex_bridge/session_*.py`：通用目录会话路由 MVP。
 - `tests-node/`：运行时策略测试。
 - `tests/`：Python 契约测试。
 - `var/bridge.db`：运行后生成的本地 SQLite；已被 Git 忽略。
 - `bin/wechat-codex-bridge`：固定版本的安装、配置、检查和启动入口。
 - `.github/workflows/ci.yml`：公开仓库的 Python 与 Node 持续集成。
+
+## 通用目录会话路由 MVP 与真实入口
+
+`session-chat` 不属于某个特定 provider，可通过统一 adapter 接入 Codex、Claude
+Code、PI 等运行时。OpenClaw 的真实 `before_dispatch` 钩子在完成私聊白名单校验
+后，把目录协议消息交给一个随 Gateway 生命周期保持的 Python JSONL 进程，因此
+每个授权发送者的 active 状态能跨多条微信消息保留。普通消息继续走原有 Codex
+harness，`message_received` 只做既有入站审计。
+
+真实运行进程从不注册 `MockSessionProvider`；mock 只存在于自动化测试。仓库已经
+实现 `CodexAppServerProvider`：它复用 OpenClaw 官方 Codex 插件的 OAuth 代理和
+App Server 客户端，使用原生 thread ID，不读取用户的 `~/.codex`。固定版 Codex
+`0.144.3` 的纯 `thread/start` 只建立内存对象，因此 runner 随后调用不含用户正文
+的 `thread/name/set`，用固定名称 `session-chat` 提交空 thread；它不启动 turn、
+不调用模型。真实探针已验证关闭 App Server 后，新进程能按同一 ID 恢复，且 cwd
+完全一致。
+
+工作根目录 `ROOT` 只作为安全边界，不是会话对象。ROOT 下任意深度的安全目录可
+保存自己的最小绑定：
+
+```json
+{
+  "schema_version": 1,
+  "provider": "mock",
+  "session_id": "mock-session-1"
+}
+```
+
+微信文本协议只有三种形式：
+
+```text
+@客户/项目甲 继续处理这个问题
+@客户/项目甲|new
+@客户/新项目|create
+```
+
+规则如下：
+
+- 原始消息的字符位置 0 必须是 ASCII `@`，不 trim，也不从中间搜索。
+- 普通消息以第一个 ASCII 空格分隔路径；后续正文原样传递，正文可以包含任意
+  `|`、`/new`、`/create`、代码和换行。
+- `|new` 只用于已经存在的目录：无绑定时建立首个 session，有有效绑定时换成新
+  session。
+- `|create` 只用于不存在的安全相对路径：显式建立缺失父目录和目标目录，再建立
+  首个 session。
+- 普通消息指向不存在目录时严格拒绝，不创建，也不回落。
+- 已存在目录没有绑定时，有旧 active 才把正文原样回落给旧 active；没有旧 active
+  就拒绝。配置损坏或恢复失败时始终拒绝，不能回落。
+- active 只按授权发送者保存在内存，进程重启后清空；目录绑定继续保留。
+- 控制事务在调用 provider 前先持久化 `IN_PROGRESS`。provider 已返回 ID、但后续
+  持久化或配置提交不能确认时，进入 `UNKNOWN_AFTER_PROVIDER_CREATE`；保留旧
+  active、旧绑定以及 `|create` 已建立的目录，相同消息编号绝不自动再创建。
+- 未授权发送者在调用 Python 进程前就被拒绝；缺少消息幂等编号也直接故障关闭。
+- `before_dispatch` 本身不携带 OpenClaw 消息编号；策略优先关联此前
+  `message_received` 持久化的网关编号，关联不到时才使用消息时间戳与正文哈希组成
+  稳定的本地幂等编号。连时间戳也没有时拒绝投递。
+- Python 进程异常、超时或返回未知错误时，策略插件吞掉该目录消息并返回安全错误，
+  不回退到 OpenClaw 默认模型会话。
+- provider 返回 `accepted_failed`、`accepted_unknown`、`not_accepted` 或
+  `interrupted` 时不会包装成成功，也不会把不完整回复发回微信。
+
+最小本地示例不会访问微信、账号或网络：
+
+```python
+from pathlib import Path
+from wechat_codex_bridge import (
+    MockSessionGateway,
+    MockSessionProvider,
+    SenderKey,
+    SessionChatRouter,
+    Store,
+)
+
+root = Path("./workspace")
+root.mkdir(exist_ok=True)
+provider = MockSessionProvider()
+router = SessionChatRouter(
+    root=root,
+    store=Store("./var/session-chat.db"),
+    providers=[provider],
+    default_provider="mock",
+)
+owner = SenderKey("wechat", "main", "owner")
+gateway = MockSessionGateway(router, frozenset({owner}))
+
+gateway.receive(
+    channel="wechat",
+    account_id="main",
+    sender_id="owner",
+    message_id="create-1",
+    body="@客户/项目甲|create",
+)
+result = gateway.receive(
+    channel="wechat",
+    account_id="main",
+    sender_id="owner",
+    message_id="message-1",
+    body="@客户/项目甲 继续处理",
+)
+print(result.reply)
+```
+
+该 MVP 使用单后端进程内锁；同一个 ROOT 不允许多个写实例。SQLite
+`session_control_operations` 保存控制事务与可能 orphan 的审计状态，
+`session_inbound_routes` 防止普通消息重复执行。它们都不替代目录绑定，也不保存
+current。
+
+`SessionChatRouter.inspect_control_operation()` 提供本机管理员只读核对入口。
+`UNKNOWN_AFTER_PROVIDER_CREATE` 或无法更新未知标记而遗留的 `IN_PROGRESS` 均不得
+自动重试。公开默认配置仍保持 provider 未启用；本机验收环境的 Codex provider
+已经通过无正文创建、`thread/name/set` 持久化、跨进程恢复、稳定 cwd 和单轮执行
+探针。MVP 不自动采纳或删除 orphan；后续 adapter 只有在能验证精确 session、cwd
+和删除回执时，才可增加权限受限的人工处置工具，且不能作为微信命令暴露。
+
+### X/Twitter 技能与 Codex 准入
+
+仓库的 `skills/x-twitter-chrome/SKILL.md` 位于 OpenClaw agent workspace 的标准
+`skills/` 目录中。配置同时把该文件作为 `requiredCodexSkill` 传给
+session-chat；任何名为 `codex` 的 provider 除通用六项合同外，还必须证明新建和
+恢复的目录会话都能发现该 workspace 技能。真实 provider 在每次 `turn/start`
+输入中显式附加该 skill，因此它不是只写在 README 里的约定。
+
+X 能力与核心目录会话准入分开报告。Codex 动态工具配置仍排除宽泛的
+`browser` 和 `computer`；`configure` 只把 Codex Desktop 已有的 Chrome 插件所需
+浏览器控制服务投影到隔离 Codex Home，并把可用后端收窄为 `chrome`。它不会共享
+用户的 Codex 线程、切换浏览器、自动登录或启用 Computer Use。前置条件是 Codex
+Desktop 的 Chrome 插件已经连接到用户当前登录的 Chrome。
+
+本地启动探针只确认隔离运行时已装载 Chrome 只读工具；真实页面读取由用户发送链接
+后验收。当前探针报告：
+
+```json
+{
+  "skill_discoverable": true,
+  "same_chrome_read_access": true,
+  "confirmed_x_writes": false,
+  "provider_admitted": true,
+  "ready": true,
+  "x_ready": false
+}
+```
+
+这表示核心 Codex 目录会话和同一 Chrome 的只读入口已装载；`x_ready` 仍为
+`false`，因为点赞、回复、转发、发布、关注和私信尚未取得与精确动作绑定的一次性
+批准。缺少 Chrome 连接时只读任务也必须故障关闭，不得改用其他浏览器、Jina、API
+或自动登录。Claude Code 和 PI 不需要伪装支持这项能力。
+
+### 部署当前集成
+
+仓库代码更新后，已安装的旧策略插件不会自动升级。由维护者明确执行下面命令，才会
+把本地策略插件复制更新、写入目录路由配置并重启前台 Gateway：
+
+```bash
+./bin/wechat-codex-bridge install
+./bin/wechat-codex-bridge configure
+./bin/wechat-codex-bridge check
+./bin/wechat-codex-bridge run
+```
+
+OpenClaw、Codex 插件和微信插件严格锁定版本。不要直接编辑 JSON 把
+`providerMode` 改成 `codex`。启用后，`check`（以及调用它的 `run`）会实际创建一个
+位于 `ROOT/.session-chat-contract-probe` 的只读探针线程，使用新进程恢复同一
+thread、核对 cwd，并执行一轮固定回执验证；任一步失败都会拒绝启动：
+
+```bash
+SESSION_CHAT_PROVIDER_MODE=codex ./bin/wechat-codex-bridge configure
+./bin/wechat-codex-bridge check
+./bin/wechat-codex-bridge run
+```
+
+合同探针不会写 `.session-chat.json` 或业务目录绑定，但会在 Codex 中留下一个
+`session-chat` 探针线程作为可审计证据。
+
+若代码位于 `~/Code/wechat-mcp`、工作目录使用 `~/brain`，执行：
+
+```bash
+SESSION_CHAT_PROVIDER_MODE=codex \
+SESSION_CHAT_ROOT="$HOME/brain" \
+./bin/wechat-codex-bridge configure
+```
+
+启用后的微信验收顺序：
+
+```text
+@验收/项目甲|create
+@验收/项目甲 只回复：目录收到-1
+@验收/项目甲 只回复：目录收到-2
+@验收/项目甲|new
+@验收/项目甲 只回复：新会话收到
+```
+
+第一条只创建目录和空 thread，不携带正文；第二、三条必须复用同一
+`.session-chat.json` 中的 thread ID；第四条显式更换 thread；第五条使用新 thread。
+不要在仓库根目录创建 `.session-chat.json`。
+
+目录回复由策略插件绑定到该入站消息的一次性精确放行凭证，再交给腾讯渠道的原生
+`sendText` 链路。授权、幂等和持久化键使用规范化联系人标识；实际投递必须保留
+入站事件中的原始大小写，以便腾讯插件取得匹配的 `contextToken`。只有
+`message_sent` 成功事件或带有效消息编号的渠道返回才能形成成功回执；同一入站
+编号不会自动重复发送。
 
 ## 固定版本
 
@@ -251,7 +466,9 @@ Node 策略测试使用本地固定版 Node：
 ```
 
 测试覆盖入站幂等、白名单拒绝、同会话直接回复、主动发送确认、拒绝、超时、正文
-变化、批准复用、出站请求幂等，以及成功和失败回执持久化。
+变化、批准复用、出站请求幂等、成功和失败回执持久化，以及目录会话 grammar、
+路径安全、配置三态、回落与失败关闭、`|new`、`|create`、重启、未知事务、真实
+Node→Python 入口和 Codex 的 X/Chrome 硬性准入。
 
 公开仓库的 GitHub Actions 会在每次 push 和 pull request 上运行同样的两组测试。
 
@@ -262,6 +479,7 @@ Node 策略测试使用本地固定版 Node：
 - OpenClaw/Codex 会话：`~/.openclaw/agents/main/sessions/`
 - 微信插件认证：由 OpenClaw 微信插件保存在 `~/.openclaw` 状态目录
 - 桥接幂等与回执：`var/bridge.db`
+- 目录路由幂等与控制事务：`var/session-chat.db`
 
 不要打印或提交这些文件的内容。SQLite 中保留了联系人标识和载荷哈希，也应按
 敏感本地数据处理。
@@ -299,7 +517,8 @@ Gateway 后由你自行归档或删除。
 
 ## Python 契约示例
 
-Python 层是安全契约与模拟适配器，不参与当前真实 OpenClaw 运行时：
+Python 层包含真实 OpenClaw 目录入口所调用的路由运行时；下面仅展示与外部服务隔离
+的基础桥接模拟适配器：
 
 ```python
 from dataclasses import replace

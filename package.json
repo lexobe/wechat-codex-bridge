@@ -1,6 +1,6 @@
 {
   "name": "wechat-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "固定版本、低权限的微信到 Codex 本地通信桥接",
   "private": false,
   "type": "module",

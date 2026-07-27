@@ -83,6 +83,26 @@
           // 经人工核对后再把唯一 ID 写入此数组并重启前台 Gateway。
           authorizedRecipients: [],
           approvalTimeoutMs: 300000,
+          sessionChat: {
+            enabled: true,
+            pythonPath: "python3",
+            projectRoot: "/ABSOLUTE/PATH/WeChat 通信",
+            root: "/ABSOLUTE/PATH/brain",
+            dbPath: "/ABSOLUTE/PATH/WeChat 通信/var/session-chat.db",
+            // 核心 Codex provider 合同通过后启用；X/Chrome 是独立能力探针，
+            // 不可用时只让 X 操作故障关闭，不伪装支持。
+            providerMode: "codex",
+            requiredCodexSkill:
+              "/ABSOLUTE/PATH/WeChat 通信/skills/x-twitter-chrome/SKILL.md",
+            codexRunner:
+              "/ABSOLUTE/PATH/WeChat 通信/openclaw/codex-provider-runner.mjs",
+            codexPluginRoot: "/ABSOLUTE/PATH/TO/@openclaw/codex",
+            openclawConfig: "/ABSOLUTE/PATH/.openclaw/openclaw.json",
+            openclawAgentDir: "/ABSOLUTE/PATH/.openclaw/agents/main/agent",
+            nodePath: "/ABSOLUTE/PATH/.openclaw/tools/node-v24.15.0/bin/node",
+            model: "gpt-5.6-sol",
+            requestTimeoutMs: 30000,
+          },
         },
       },
     },

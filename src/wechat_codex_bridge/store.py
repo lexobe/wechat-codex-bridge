@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,7 +13,6 @@ from .models import (
     PendingAction,
     utc_now,
 )
-
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -58,6 +58,54 @@ CREATE TABLE IF NOT EXISTS outbound_receipts (
     gateway_receipt_id TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_control_operations (
+    channel TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    command TEXT NOT NULL CHECK (command IN ('new', 'create')),
+    target_key TEXT NOT NULL,
+    message_hash TEXT NOT NULL,
+    provider TEXT,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'in_progress',
+            'directory_created',
+            'session_created',
+            'binding_committed',
+            'completed',
+            'failed',
+            'unknown_after_provider_create'
+        )
+    ),
+    session_ref TEXT,
+    created_directories_json TEXT,
+    provider_create_started_at TEXT,
+    provider_create_returned_at TEXT,
+    uncertainty_reason TEXT,
+    manual_review_required INTEGER NOT NULL DEFAULT 0
+        CHECK (manual_review_required IN (0, 1)),
+    manual_resolution_json TEXT,
+    result_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel, account_id, sender_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_inbound_routes (
+    channel TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    message_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('processing', 'completed', 'unknown')),
+    result_json TEXT,
+    received_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel, account_id, sender_id, message_id)
 );
 """
 
@@ -269,4 +317,355 @@ class Store:
                     receipt.status,
                     receipt.created_at,
                 ),
+            )
+
+    def begin_session_control(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+        command: str,
+        target_key: str,
+        message_hash: str,
+    ) -> tuple[bool, dict[str, object]]:
+        now = utc_now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO session_control_operations
+                    (channel, account_id, sender_id, message_id, command,
+                     target_key, message_hash, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)
+                ON CONFLICT(channel, account_id, sender_id, message_id) DO NOTHING
+                """,
+                (
+                    channel,
+                    account_id,
+                    sender_id,
+                    message_id,
+                    command,
+                    target_key,
+                    message_hash,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM session_control_operations
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ?
+                """,
+                (channel, account_id, sender_id, message_id),
+            ).fetchone()
+        record = dict(row)
+        if (
+            record["command"] != command
+            or record["target_key"] != target_key
+            or record["message_hash"] != message_hash
+        ):
+            raise ValueError("message_id 已绑定到其他控制请求")
+        return cursor.rowcount == 1, record
+
+    def get_session_control(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+    ) -> dict[str, object] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM session_control_operations
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ?
+                """,
+                (channel, account_id, sender_id, message_id),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def update_session_control(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+        expected_states: tuple[str, ...],
+        new_state: str,
+        provider: str | None = None,
+        session_ref: str | None = None,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        placeholders = ",".join("?" for _ in expected_states)
+        now = utc_now()
+        result_json = (
+            json.dumps(result, ensure_ascii=False, sort_keys=True)
+            if result is not None
+            else None
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE session_control_operations
+                SET state = ?,
+                    provider = COALESCE(?, provider),
+                    session_ref = COALESCE(?, session_ref),
+                    result_json = COALESCE(?, result_json),
+                    error = ?,
+                    uncertainty_reason = CASE
+                        WHEN ? = 'unknown_after_provider_create' THEN ?
+                        ELSE uncertainty_reason
+                    END,
+                    manual_review_required = CASE
+                        WHEN ? = 'unknown_after_provider_create' THEN 1
+                        ELSE manual_review_required
+                    END,
+                    provider_create_returned_at = CASE
+                        WHEN ? = 'unknown_after_provider_create'
+                        THEN COALESCE(provider_create_returned_at, ?)
+                        ELSE provider_create_returned_at
+                    END,
+                    updated_at = ?
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ? AND state IN ({placeholders})
+                """,
+                (
+                    new_state,
+                    provider,
+                    session_ref,
+                    result_json,
+                    error,
+                    new_state,
+                    error,
+                    new_state,
+                    new_state,
+                    now,
+                    now,
+                    channel,
+                    account_id,
+                    sender_id,
+                    message_id,
+                    *expected_states,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"控制事务状态无法从 {expected_states} 更新为 {new_state}"
+            )
+
+    def mark_session_directories_created(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+        directories: list[str],
+    ) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE session_control_operations
+                SET state = 'directory_created',
+                    created_directories_json = ?,
+                    updated_at = ?
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ? AND state = 'in_progress'
+                """,
+                (
+                    json.dumps(directories, ensure_ascii=False),
+                    utc_now(),
+                    channel,
+                    account_id,
+                    sender_id,
+                    message_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("已创建目录状态无法持久化")
+
+    def mark_provider_create_started(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+        provider: str,
+    ) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE session_control_operations
+                SET provider = ?,
+                    provider_create_started_at = ?,
+                    updated_at = ?
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ?
+                  AND state IN ('in_progress', 'directory_created')
+                  AND provider_create_started_at IS NULL
+                """,
+                (
+                    provider,
+                    utc_now(),
+                    utc_now(),
+                    channel,
+                    account_id,
+                    sender_id,
+                    message_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("provider 创建开始状态无法持久化")
+
+    def mark_session_created(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+        provider: str,
+        session_ref: str,
+    ) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE session_control_operations
+                SET state = 'session_created',
+                    provider = ?,
+                    session_ref = ?,
+                    provider_create_returned_at = ?,
+                    updated_at = ?
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ?
+                  AND state IN ('in_progress', 'directory_created')
+                  AND provider_create_started_at IS NOT NULL
+                """,
+                (
+                    provider,
+                    session_ref,
+                    utc_now(),
+                    utc_now(),
+                    channel,
+                    account_id,
+                    sender_id,
+                    message_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("SESSION_CREATED 无法持久化")
+
+    def begin_session_route(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+        message_hash: str,
+    ) -> tuple[bool, dict[str, object]]:
+        now = utc_now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO session_inbound_routes
+                    (channel, account_id, sender_id, message_id, message_hash,
+                     state, received_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'processing', ?, ?)
+                ON CONFLICT(channel, account_id, sender_id, message_id) DO NOTHING
+                """,
+                (
+                    channel,
+                    account_id,
+                    sender_id,
+                    message_id,
+                    message_hash,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM session_inbound_routes
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ?
+                """,
+                (channel, account_id, sender_id, message_id),
+            ).fetchone()
+        record = dict(row)
+        if record["message_hash"] != message_hash:
+            raise ValueError("message_id 已绑定到其他普通消息")
+        return cursor.rowcount == 1, record
+
+    def finish_session_route(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+        result: dict[str, object],
+    ) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE session_inbound_routes
+                SET state = 'completed', result_json = ?, updated_at = ?
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ? AND state = 'processing'
+                """,
+                (
+                    json.dumps(result, ensure_ascii=False, sort_keys=True),
+                    utc_now(),
+                    channel,
+                    account_id,
+                    sender_id,
+                    message_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("普通消息幂等结果无法提交")
+
+    def mark_session_route_unknown(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE session_inbound_routes
+                SET state = 'unknown', updated_at = ?
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ? AND state = 'processing'
+                """,
+                (utc_now(), channel, account_id, sender_id, message_id),
+            )
+
+    def abandon_session_route(
+        self,
+        *,
+        channel: str,
+        account_id: str,
+        sender_id: str,
+        message_id: str,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM session_inbound_routes
+                WHERE channel = ? AND account_id = ? AND sender_id = ?
+                  AND message_id = ? AND state = 'processing'
+                """,
+                (channel, account_id, sender_id, message_id),
             )

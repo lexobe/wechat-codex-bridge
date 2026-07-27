@@ -71,3 +71,27 @@ def test_approved_reminder_and_request_id_are_idempotent(tmp_path):
 
     with pytest.raises(ValueError, match="其他载荷"):
         tool.send(replace(approved, body="复用请求编号时修改内容"))
+
+
+def test_ambiguous_gateway_failure_does_not_restore_approval(tmp_path):
+    class AmbiguousGateway:
+        def __init__(self):
+            self.calls = 0
+
+        def send(self, request):
+            self.calls += 1
+            raise TimeoutError("发送后回执丢失")
+
+    gateway = AmbiguousGateway()
+    tool = ControlledSendTool(Store(tmp_path / "bridge.db"), gateway, {"contact:alice"})
+    request = OutboundRequest("r-unknown", "wechat", "contact:alice", "只发送一次")
+    pending = tool.request_confirmation(request)
+    tool.approve(pending.confirmation_id)
+    approved = replace(request, confirmation_id=pending.confirmation_id)
+
+    with pytest.raises(TimeoutError, match="回执丢失"):
+        tool.send(approved)
+    with pytest.raises(ConfirmationRequired):
+        tool.send(approved)
+
+    assert gateway.calls == 1

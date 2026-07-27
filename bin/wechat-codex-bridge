@@ -12,6 +12,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OPENCLAW_PREFIX="${OPENCLAW_PREFIX:-$HOME/.openclaw}"
 OPENCLAW_BIN="$OPENCLAW_PREFIX/bin/openclaw"
 PINNED_NODE="$OPENCLAW_PREFIX/tools/node-v24.15.0/bin/node"
+BRIDGE_PYTHON="${BRIDGE_PYTHON:-$(command -v python3)}"
 
 usage() {
   cat <<'EOF'
@@ -27,6 +28,9 @@ usage() {
 
 环境变量：
   OPENCLAW_PREFIX  OpenClaw 用户本地安装目录，默认 ~/.openclaw
+  SESSION_CHAT_PROVIDER_MODE  仅在真实合同探针通过后设为 codex；默认 disabled
+  SESSION_CHAT_ROOT  目录会话工作根目录；默认使用代码目录
+  BRIDGE_PYTHON  Python 3.11+ 的绝对路径；默认使用当前 shell 的 python3
 EOF
 }
 
@@ -65,6 +69,14 @@ check_versions() {
   expect_contains "$weixin_info" "\"version\": \"$WEIXIN_PLUGIN_VERSION\"" "微信插件"
 }
 
+find_codex_plugin_root() {
+  local manifest
+  manifest="$(find "$OPENCLAW_PREFIX/npm/projects" -path \
+    '*/node_modules/@openclaw/codex/openclaw.plugin.json' -print -quit 2>/dev/null)"
+  [[ -n "$manifest" ]] || die "无法定位固定版 Codex 插件目录"
+  dirname "$manifest"
+}
+
 install_plugin_if_missing() {
   local plugin_id="$1"
   local plugin_spec="$2"
@@ -76,7 +88,7 @@ install_plugin_if_missing() {
 }
 
 cmd_version() {
-  printf 'wechat-codex-bridge 0.1.0\n'
+  printf 'wechat-codex-bridge 0.2.0\n'
   printf 'OpenClaw %s\n' "$OPENCLAW_VERSION"
   printf 'Node.js %s\n' "${NODE_VERSION#v}"
   printf '@openclaw/codex %s\n' "$CODEX_PLUGIN_VERSION"
@@ -107,9 +119,8 @@ cmd_install() {
   install_plugin_if_missing \
     openclaw-weixin \
     "@tencent-weixin/openclaw-weixin@$WEIXIN_PLUGIN_VERSION"
-  install_plugin_if_missing \
-    wechat-codex-bridge-policy \
-    "$PROJECT_DIR/openclaw/bridge-policy"
+  "$OPENCLAW_BIN" plugins install \
+    --force "$PROJECT_DIR/openclaw/bridge-policy"
 
   cmd_configure
   check_versions
@@ -118,7 +129,42 @@ cmd_install() {
 
 cmd_configure() {
   require_openclaw
+  local codex_plugin_root
+  local session_chat_root
+  local chrome_runtime_json
+  local chrome_codex_skill
+  local chrome_browser_client
+  local chrome_mcp_server
+  codex_plugin_root="$(find_codex_plugin_root)"
+  session_chat_root="${SESSION_CHAT_ROOT:-$PROJECT_DIR}"
+  [[ "$session_chat_root" == /* ]] ||
+    die "SESSION_CHAT_ROOT 必须是绝对路径"
+  mkdir -p "$session_chat_root"
+  session_chat_root="$(cd "$session_chat_root" && pwd -P)"
+  local session_chat_skill_dir
+  session_chat_skill_dir="$session_chat_root/skills/x-twitter-chrome"
+  mkdir -p "$session_chat_skill_dir/agents"
+  if [[ "$PROJECT_DIR/skills/x-twitter-chrome/SKILL.md" != \
+    "$session_chat_skill_dir/SKILL.md" ]]; then
+    install -m 0644 \
+      "$PROJECT_DIR/skills/x-twitter-chrome/SKILL.md" \
+      "$session_chat_skill_dir/SKILL.md"
+  fi
+  if [[ "$PROJECT_DIR/skills/x-twitter-chrome/agents/openai.yaml" != \
+    "$session_chat_skill_dir/agents/openai.yaml" ]]; then
+    install -m 0644 \
+      "$PROJECT_DIR/skills/x-twitter-chrome/agents/openai.yaml" \
+      "$session_chat_skill_dir/agents/openai.yaml"
+  fi
   mkdir -p "$PROJECT_DIR/var"
+  chrome_runtime_json="$(PYTHONPATH="$PROJECT_DIR/src" "$BRIDGE_PYTHON" -m \
+    wechat_codex_bridge.chrome_runtime \
+    --source-codex-home "$HOME/.codex" \
+    --agent-codex-home "$OPENCLAW_PREFIX/agents/main/agent/codex-home" \
+    --write-agent-config)"
+  chrome_codex_skill="$(jq -r '.control_skill' <<<"$chrome_runtime_json")"
+  chrome_browser_client="$(jq -r '.browser_client' <<<"$chrome_runtime_json")"
+  chrome_mcp_server="$(jq -c '.mcp_server' <<<"$chrome_runtime_json")"
 
   "$OPENCLAW_BIN" config set update.auto.enabled false --strict-json
   "$OPENCLAW_BIN" config set plugins.bundledDiscovery allowlist
@@ -135,6 +181,8 @@ cmd_configure() {
     '["openai","codex","openclaw-weixin","wechat-codex-bridge-policy"]' \
     --strict-json --replace
   "$OPENCLAW_BIN" config set plugins.slots.memory none
+  "$OPENCLAW_BIN" config set mcp.servers.node_repl \
+    "$chrome_mcp_server" --strict-json --replace
 
   "$OPENCLAW_BIN" config set plugins.entries.codex.enabled true --strict-json
   "$OPENCLAW_BIN" config set \
@@ -185,9 +233,45 @@ cmd_configure() {
   "$OPENCLAW_BIN" config set \
     'plugins.entries["wechat-codex-bridge-policy"].config.approvalTimeoutMs' \
     300000 --strict-json
+  local session_chat_json
+  session_chat_json="$(jq -nc \
+    --arg project "$PROJECT_DIR" \
+    --arg root "$session_chat_root" \
+    --arg python "$BRIDGE_PYTHON" \
+    --arg db "$PROJECT_DIR/var/session-chat.db" \
+    --arg mode "${SESSION_CHAT_PROVIDER_MODE:-disabled}" \
+    --arg skill "$session_chat_skill_dir/SKILL.md" \
+    --arg chrome_skill "$chrome_codex_skill" \
+    --arg browser_client "$chrome_browser_client" \
+    --arg runner "$PROJECT_DIR/openclaw/codex-provider-runner.mjs" \
+    --arg plugin "$codex_plugin_root" \
+    --arg config "$OPENCLAW_PREFIX/openclaw.json" \
+    --arg agent "$OPENCLAW_PREFIX/agents/main/agent" \
+    --arg node "$PINNED_NODE" \
+    '{
+      enabled: true,
+      pythonPath: $python,
+      projectRoot: $project,
+      root: $root,
+      dbPath: $db,
+      providerMode: $mode,
+      requiredCodexSkill: $skill,
+      chromeCodexSkill: $chrome_skill,
+      chromeBrowserClient: $browser_client,
+      codexRunner: $runner,
+      codexPluginRoot: $plugin,
+      openclawConfig: $config,
+      openclawAgentDir: $agent,
+      nodePath: $node,
+      model: "gpt-5.6-sol",
+      requestTimeoutMs: 300000
+    }')"
+  "$OPENCLAW_BIN" config set \
+    'plugins.entries["wechat-codex-bridge-policy"].config.sessionChat' \
+    "$session_chat_json" --strict-json --replace
 
   "$OPENCLAW_BIN" config validate
-  printf '配置完成；自动升级已显式关闭，白名单保持为空。\n'
+  printf '配置完成；自动升级已显式关闭，现有白名单保持不变。\n'
 }
 
 cmd_login() {
@@ -206,7 +290,64 @@ cmd_check() {
   "$OPENCLAW_BIN" config validate
   "$OPENCLAW_BIN" plugins inspect wechat-codex-bridge-policy --runtime --json \
     >/dev/null
-  printf '检查通过：固定版本匹配、自动升级关闭、配置和策略插件有效。\n'
+  local provider_mode
+  local probe_info
+  local codex_plugin_root
+  local session_chat_root
+  local session_chat_python
+  local session_chat_skill
+  local chrome_codex_skill
+  local chrome_browser_client
+  local probe_command
+  provider_mode="$("$OPENCLAW_BIN" config get \
+    'plugins.entries["wechat-codex-bridge-policy"].config.sessionChat.providerMode')"
+  session_chat_root="$("$OPENCLAW_BIN" config get \
+    'plugins.entries["wechat-codex-bridge-policy"].config.sessionChat.root')"
+  session_chat_python="$("$OPENCLAW_BIN" config get \
+    'plugins.entries["wechat-codex-bridge-policy"].config.sessionChat.pythonPath')"
+  session_chat_skill="$("$OPENCLAW_BIN" config get \
+    'plugins.entries["wechat-codex-bridge-policy"].config.sessionChat.requiredCodexSkill')"
+  chrome_codex_skill="$("$OPENCLAW_BIN" config get \
+    'plugins.entries["wechat-codex-bridge-policy"].config.sessionChat.chromeCodexSkill')"
+  chrome_browser_client="$("$OPENCLAW_BIN" config get \
+    'plugins.entries["wechat-codex-bridge-policy"].config.sessionChat.chromeBrowserClient')"
+  [[ -x "$session_chat_python" ]] ||
+    die "session-chat Python 不可执行：$session_chat_python"
+  codex_plugin_root="$(find_codex_plugin_root)"
+  probe_command="probe"
+  if [[ "$provider_mode" == "codex" ]]; then
+    probe_command="contract-probe"
+  fi
+  probe_info="$(PYTHONPATH="$PROJECT_DIR/src" "$session_chat_python" -m \
+    wechat_codex_bridge.session_runtime "$probe_command" \
+    --root "$session_chat_root" \
+    --db "$PROJECT_DIR/var/session-chat.db" \
+    --provider-mode "$provider_mode" \
+    --required-codex-skill \
+    "$session_chat_skill" \
+    --chrome-codex-skill "$chrome_codex_skill" \
+    --chrome-browser-client "$chrome_browser_client" \
+    --codex-runner "$PROJECT_DIR/openclaw/codex-provider-runner.mjs" \
+    --codex-plugin-root "$codex_plugin_root" \
+    --openclaw-config "$OPENCLAW_PREFIX/openclaw.json" \
+    --openclaw-agent-dir "$OPENCLAW_PREFIX/agents/main/agent" \
+    --node-path "$PINNED_NODE" \
+    --model gpt-5.6-sol)"
+  if [[ "$provider_mode" == "codex" && "$probe_info" != *'"passed": true'* ]]; then
+    die "Codex session provider 合同探针未通过，拒绝启动"
+  fi
+  if [[ "$provider_mode" == "disabled" ]]; then
+    printf '检查通过：session-chat 已接入但真实 provider 处于故障关闭模式。\n'
+  else
+    printf '检查通过：固定版本、策略插件和 session-chat provider 真实合同探针有效。\n'
+    if [[ "$probe_info" != *'"x_ready": true'* ]]; then
+      if [[ "$probe_info" == *'"same_chrome_read_access": true'* ]]; then
+        printf '提示：同一 Chrome 只读工具已装载；X 写操作仍须一次性确认并保持故障关闭。\n'
+      else
+        printf '提示：X 技能已注入，但同一 Chrome 工具未装载，X 访问将故障关闭。\n'
+      fi
+    fi
+  fi
 }
 
 cmd_run() {
